@@ -9,9 +9,12 @@ import (
 	"compress/gzip"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io/ioutil"
 	"log"
+	"os"
+	"path"
 	"reflect"
 	"sort"
 	"strings"
@@ -28,66 +31,78 @@ import (
 	"google.golang.org/api/iterator"
 )
 
+const cacheFolderPermissions = 0755
+const cacheFilePermissions = 0644
+
 var (
-	limiter = rate.NewLimiter(50, 50)
+	cachePath        = flag.String("cache_path", "", "Path to cache the GCS objects. If empty, fetches are not cached.")
+	rateLimitFetches = flag.Bool("rate_limit", true, "Whether to rate limit the file fetches (Default: true)")
+	limiter          = rate.NewLimiter(50, 50)
 )
 
+// OutputLocation specifies the destinations for output.
 type OutputLocation struct {
 	GCSObjectPath string
 	BQDatasetName string
 	BQTableName   string
 }
 
-type OutputId struct {
+// OutputID identifies an output.
+type OutputID struct {
 	MetadataLocation OutputLocation
 	DataLocation     OutputLocation
 }
 
+// Outputter abstracts writing to storage.
 type Outputter interface {
-	Output(OutputId, interface{}, []interface{}) (interface{}, []interface{}, []error)
+	Output(OutputID, interface{}, []interface{}) (interface{}, []interface{}, []error)
 }
 
-// Encapsulate bucket name and handle; both are needed for some storage
-// read/write routines.
+// Bucket encapsulates bucket name and handle; both are needed for some storage read/write routines.
 type Bucket struct {
 	Name   string
 	Handle *storage.BucketHandle
 }
 
-// Encapsulate info required to read from or write to a storage bucket.
+// GCSDatastoreContext encapsulate info required to read from or write to a storage bucket.
 type GCSDatastoreContext struct {
 	Context context.Context
 	Bucket  Bucket
 	Client  *datastore.Client
 }
 
+// GCSData encapsulates the metadata and data stored in Google Cloud Storage.
 type GCSData struct {
 	Metadata interface{}   `json:"metadata"`
 	Data     []interface{} `json:"data"`
 }
 
+// BQDataset identifies a BigQuery dataset by name.
 type BQDataset struct {
 	Name    string
 	Dataset *bigquery.Dataset
 }
 
+// BQTable identifies a BigQuery table by name.
 type BQTable struct {
 	Name  string
 	Table *bigquery.Table
 }
 
+// BQCollection aggregates a dataset and a table.
 type BQCollection struct {
 	Dataset BQDataset
 	Table   BQTable
 }
 
+// BQContext aggregates a context and client.
 type BQContext struct {
 	Context context.Context
 	Client  *bigquery.Client
 }
 
-func (ctx GCSDatastoreContext) Output(id OutputId, metadata interface{},
-	data []interface{}) (
+// Output writes the data to GCS.
+func (ctx GCSDatastoreContext) Output(id OutputID, metadata interface{}, data []interface{}) (
 	metadataWritten interface{}, dataWritten []interface{}, errs []error) {
 	name := fmt.Sprintf("%s/%s", ctx.Bucket.Name,
 		id.DataLocation.GCSObjectPath)
@@ -162,7 +177,8 @@ func (ctx GCSDatastoreContext) Output(id OutputId, metadata interface{},
 	return metadataWritten, dataWritten, errs
 }
 
-func (ctx BQContext) Output(id OutputId, metadata interface{},
+// Output writes the data to BigQuery.
+func (ctx BQContext) Output(id OutputID, metadata interface{},
 	data []interface{}) (metadataWritten interface{},
 	dataWritten []interface{}, errs []error) {
 	dataName := fmt.Sprintf("%s.%s", id.DataLocation.BQDatasetName,
@@ -261,10 +277,19 @@ func (ctx BQContext) Output(id OutputId, metadata interface{},
 	return metadataWritten, dataWritten, errs
 }
 
-// Load (test run, test results) pairs for given test runs. Use client in
-// context to load data from bucket.
+// LoadTestRunResults loads (test run, test results) pairs for given test runs.
+// Use client in context to load data from bucket.
 func LoadTestRunResults(ctx *GCSDatastoreContext, runs []base.TestRun) (
 	runResults []metrics.TestRunResults) {
+
+	if *cachePath != "" {
+		if _, statErr := os.Stat(*cachePath); os.IsNotExist(statErr) {
+			if err := os.MkdirAll(*cachePath, cacheFolderPermissions); err != nil {
+				log.Fatalf("Failed to create cache dir %s: %s", *cachePath, err.Error())
+			}
+		}
+	}
+
 	resultChan := make(chan metrics.TestRunResults, 0)
 	errChan := make(chan error, 0)
 	runResults = make([]metrics.TestRunResults, 0, 100000)
@@ -388,49 +413,99 @@ func processTestRun(ctx *GCSDatastoreContext, testRun *base.TestRun,
 func loadTestResults(ctx *GCSDatastoreContext, testRun *base.TestRun,
 	objName string, resultChan chan metrics.TestRunResults,
 	errChan chan error) {
-	// Rate limit.
-	limiter.Wait(ctx.Context)
 
-	// Read object from GCS
-	obj := ctx.Bucket.Handle.Object(objName)
-	reader, err := obj.NewReader(ctx.Context)
-	if err != nil {
-		errChan <- err
-		return
+	var data []byte
+	var err error
+	if *cachePath != "" {
+		filename := path.Join(*cachePath, objName)
+		if data, err = loadCachedFile(filename); err != nil {
+			log.Printf("Error reading cached object %s", objName)
+			errChan <- err
+			return
+		}
 	}
-	defer reader.Close()
-	data, err := ioutil.ReadAll(reader)
-	if err != nil {
-		errChan <- err
-		return
+
+	if data == nil {
+		data, err = fetchFile(objName, ctx)
+		if err != nil {
+			log.Printf("Error fetching object %s", objName)
+			if err != storage.ErrObjectNotExist {
+				errChan <- err
+			}
+			return
+		}
+		if *cachePath != "" {
+			err = writeCacheFile(path.Join(*cachePath, objName), data)
+			if err != nil {
+				log.Printf("Failed to write cache object %s", objName)
+				errChan <- err
+				return
+			}
+		}
 	}
 
 	// Unmarshal JSON, which may be gzipped.
 	var results metrics.TestResults
-	var anyResult interface{}
-	if err := json.Unmarshal(data, &anyResult); err != nil {
-		reader2 := bytes.NewReader(data)
-		reader3, err := gzip.NewReader(reader2)
-		if err != nil {
-			errChan <- err
-			return
-		}
+	jsonData := data
+
+	// Try unzip.
+	reader2 := bytes.NewReader(data)
+	reader3, err := gzip.NewReader(reader2)
+	if err == nil {
 		defer reader3.Close()
 		unzippedData, err := ioutil.ReadAll(reader3)
 		if err != nil {
+			log.Printf("Error reading unzipped object %s", objName)
 			errChan <- err
 			return
 		}
-		if err := json.Unmarshal(unzippedData, &results); err != nil {
-			errChan <- err
-			return
-		}
-		resultChan <- metrics.TestRunResults{testRun, &results}
-	} else {
-		if err := json.Unmarshal(data, &results); err != nil {
-			errChan <- err
-			return
-		}
-		resultChan <- metrics.TestRunResults{testRun, &results}
+		jsonData = unzippedData
 	}
+
+	if err := json.Unmarshal(jsonData, &results); err != nil {
+		log.Printf("Error unmarshalling object %s", objName)
+		errChan <- err
+		return
+	}
+	resultChan <- metrics.TestRunResults{
+		Run: testRun,
+		Res: &results,
+	}
+}
+
+func loadCachedFile(filename string) ([]byte, error) {
+	if _, statErr := os.Stat(filename); os.IsNotExist(statErr) {
+		return nil, nil
+	}
+	return ioutil.ReadFile(filename)
+}
+
+func writeCacheFile(filename string, data []byte) error {
+	// Make parent dir(s).
+	func() {
+		pieces := strings.Split(filename, "/")
+		parentDir := strings.Join(pieces[:len(pieces)-1], "/")
+		if err := os.MkdirAll(parentDir, cacheFolderPermissions); err != nil {
+			log.Printf("Failed to make parent dir %s", parentDir)
+		}
+	}()
+
+	// Write cache file.
+	return ioutil.WriteFile(filename, data, cacheFilePermissions)
+}
+
+func fetchFile(objName string, ctx *GCSDatastoreContext) ([]byte, error) {
+	// Rate limit.
+	if *rateLimitFetches {
+		limiter.Wait(ctx.Context)
+	}
+	// Read object from GCS.
+	obj := ctx.Bucket.Handle.Object(objName)
+	reader, err := obj.NewReader(ctx.Context)
+	if err != nil {
+		log.Printf("Error loading object %s: %s", objName, err.Error())
+		return nil, err
+	}
+	defer reader.Close()
+	return ioutil.ReadAll(reader)
 }
