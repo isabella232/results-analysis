@@ -110,8 +110,8 @@ const (
 	// not be used.
 	TestStatusUnknown TestStatus = 0
 
-	// TestStatusOK indicates that all tests completed successfully.
-	TestStatusOK TestStatus = 1
+	// TestStatusPass indicates that all tests completed successfully and passed.
+	TestStatusPass TestStatus = 1
 
 	// TestStatusError indicates that some tests did not complete
 	// successfully.
@@ -120,24 +120,24 @@ const (
 	// TestStatusTimeout indicates that some tests timed out.
 	TestStatusTimeout TestStatus = 3
 
-	// TestStatusPass indicates that all tests completed successfully and passed.
-	TestStatusPass TestStatus = 4
+	// TestStatusOK indicates that all tests completed successfully.
+	TestStatusOK TestStatus = 4
 )
 
 var testStatusNames = map[int32]string{
 	0: "TEST_STATUS_UNKNOWN",
-	1: "TEST_OK",
+	1: "TEST_PASS",
 	2: "TEST_ERROR",
 	3: "TEST_TIMEOUT",
-	4: "TEST_PASS",
+	4: "TEST_OK",
 }
 
 var testStatusValues = map[string]int32{
 	"TEST_STATUS_UNKNOWN": 0,
-	"TEST_OK":             1,
+	"TEST_PASS":           1,
 	"TEST_ERROR":          2,
 	"TEST_TIMEOUT":        3,
-	"TEST_PASS":           4,
+	"TEST_OK":             4,
 }
 
 // TestStatusFromString produces a TestStatus value from a name.
@@ -176,8 +176,11 @@ const (
 	// SubTestStatusTimeout indicates that a test timed out.
 	SubTestStatusTimeout SubTestStatus = 3
 
+	// SubTestStatusNotUsed is not used. It exists to avoid collisions with TestStatusOK.
+	SubTestStatusNotUsed SubTestStatus = 4
+
 	// SubTestStatusNotRun indicates that a test was not run.
-	SubTestStatusNotRun SubTestStatus = 4
+	SubTestStatusNotRun SubTestStatus = 5
 )
 
 var subTestStatusNames = map[int32]string{
@@ -185,7 +188,8 @@ var subTestStatusNames = map[int32]string{
 	1: "SUB_TEST_PASS",
 	2: "SUB_TEST_FAIL",
 	3: "SUB_TEST_TIMEOUT",
-	4: "SUB_TEST_NOT_RUN",
+	4: "SUB_TEST_NOT_USED",
+	5: "SUB_TEST_NOT_RUN",
 }
 
 var subTestStatusValues = map[string]int32{
@@ -193,7 +197,8 @@ var subTestStatusValues = map[string]int32{
 	"SUB_TEST_PASS":           1,
 	"SUB_TEST_FAIL":           2,
 	"SUB_TEST_TIMEOUT":        3,
-	"SUB_TEST_NOT_RUN":        4,
+	"SUB_TEST_NOT_USED":       4,
+	"SUB_TEST_NOT_RUN":        5,
 }
 
 // SubTestStatusFromString produces a SubTestStatus value from a name.
